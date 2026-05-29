@@ -1,0 +1,13 @@
+langchain
+langchain-community
+langchain-huggingface
+langchain-pinecone
+langchain-ollama
+pinecone-client
+sentence-transformers
+pypdf
+unstructured
+streamlit
+python-dotenv
+tiktoken
+rank_bm25
