@@ -1,4 +1,4 @@
-# Advanced Local RAG Pipeline
+# Local RAG Pipeline
 
 A production-ready, locally hosted Retrieval Augmented Generation (RAG) pipeline designed for deep, context-aware document analysis. This project allows you to ingest PDF documents, store them in a vector database, and chat with them using a local Large Language Model (LLM) through a beautiful web interface.
 
