@@ -11,3 +11,8 @@ streamlit
 python-dotenv
 tiktoken
 rank_bm25
+fastapi
+uvicorn
+requests
+pinecone-text
+pydantic

@@ -1,13 +1,18 @@
 services:
-  rag:
+  api:
     build: .
-    # host networking lets the container reach Ollama at localhost:11434
     network_mode: host
     env_file:
       - .env
     volumes:
-      # Mount data/ so you can add documents without rebuilding
       - ./data:/app/data
-    # Default CMD runs Streamlit (see Dockerfile)
-    # To run ingestion instead:
-    #   docker compose run rag python ingestion.py
+    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+  ui:
+    build: .
+    network_mode: host
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    command: ["streamlit", "run", "app.py", "--server.address", "0.0.0.0", "--server.port", "8501"]

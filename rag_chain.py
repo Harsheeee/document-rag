@@ -1,157 +1,111 @@
-"""
-rag_chain.py — Retrieval & Generation Pipeline
-=================================================
-Phase 2 of the RAG pipeline.
-Connects to the existing Pinecone index, retrieves relevant document chunks
-for a user query, and generates an answer using a local Ollama LLM.
-
-Uses the modern LangChain LCEL (LangChain Expression Language) API.
-This module is imported by app.py (the Streamlit frontend).
-"""
-
 import os
 from dotenv import load_dotenv
+from pinecone import Pinecone
 from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_pinecone import PineconeVectorStore
+from langchain_community.retrievers import PineconeHybridSearchRetriever
 from langchain_ollama import ChatOllama
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.runnables import RunnablePassthrough
-from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_classic.chains import create_history_aware_retriever, create_retrieval_chain
+from langchain_classic.chains.combine_documents import create_stuff_documents_chain
+from langchain_classic.retrievers.document_compressors import CrossEncoderReranker
+from langchain_community.cross_encoders import HuggingFaceCrossEncoder
+from langchain_classic.retrievers import ContextualCompressionRetriever
+from pinecone_text.sparse import BM25Encoder
 
-# ── Load environment variables ───────────────────────────────────────────────
 load_dotenv()
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 PINECONE_INDEX_NAME = "rag"
-
-# Ollama base URL — works with host networking in Docker
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Step 1: Initialize Embedding Model (must match ingestion)
-# ══════════════════════════════════════════════════════════════════════════════
-
+# 1. Embeddings & Sparse Encoder
 embedding_model = HuggingFaceEmbeddings(
     model_name="sentence-transformers/all-MiniLM-L6-v2",
     model_kwargs={"device": "cpu"},
 )
 
+if os.path.exists("bm25_values.json"):
+    sparse_encoder = BM25Encoder().default()
+    sparse_encoder.load("bm25_values.json")
+else:
+    sparse_encoder = BM25Encoder().default()
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Step 2: Connect to Pinecone & Create Retriever
-# ══════════════════════════════════════════════════════════════════════════════
+# 2. Pinecone Hybrid Search Retriever
+pc = Pinecone(api_key=PINECONE_API_KEY)
+index = pc.Index(PINECONE_INDEX_NAME)
 
-vectorstore = PineconeVectorStore.from_existing_index(
-    index_name=PINECONE_INDEX_NAME,
-    embedding=embedding_model,
+base_retriever = PineconeHybridSearchRetriever(
+    embeddings=embedding_model,
+    sparse_encoder=sparse_encoder,
+    index=index,
+    top_k=15, # Retrieve more chunks initially for re-ranking
 )
 
-retriever = vectorstore.as_retriever(
-    search_type="similarity",
-    search_kwargs={"k": 6},
+# 3. Cross-Encoder Re-ranker
+cross_encoder_model = HuggingFaceCrossEncoder(model_name="cross-encoder/ms-marco-MiniLM-L-6-v2")
+compressor = CrossEncoderReranker(model=cross_encoder_model, top_n=5)
+compression_retriever = ContextualCompressionRetriever(
+    base_compressor=compressor, base_retriever=base_retriever
 )
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Step 3: Initialize the Local LLM via Ollama
-# ══════════════════════════════════════════════════════════════════════════════
-
+# 4. LLM
 llm = ChatOllama(
     model="llama3",
     temperature=0,
     base_url=OLLAMA_BASE_URL,
 )
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Step 4: Define the RAG Prompt Template
-# ══════════════════════════════════════════════════════════════════════════════
-
-prompt = ChatPromptTemplate.from_messages([
-    ("system", """You are a precise document-analysis assistant. Your ONLY job is to answer questions using the provided document excerpts.
-
-STRICT RULES:
-1. Use ONLY the information in the CONTEXT below. Do NOT use your own knowledge.
-2. Read every excerpt carefully before answering.
-3. If multiple excerpts contain relevant information, synthesize them into a complete answer.
-4. For every factual claim, cite the source like this: [Source: filename, page X].
-5. If the context does not contain enough information to answer, respond EXACTLY with: "I don't have enough information in the provided documents to answer this question."
-6. Be thorough — include all relevant details from the context, not just the first match you find.
-7. Keep your answer well-structured. Use bullet points or numbered lists when listing multiple items."""),
-    ("human", """CONTEXT (document excerpts):
-{context}
-
----
-QUESTION: {question}
-
-Provide a thorough, well-cited answer based ONLY on the context above:""")
-])
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Step 5: Build the RAG Chain using LCEL
-# ══════════════════════════════════════════════════════════════════════════════
-
-def format_docs(docs):
-    """Format retrieved documents into a numbered, clearly-labeled context string."""
-    formatted = []
-    for i, doc in enumerate(docs, 1):
-        source = doc.metadata.get("source", "unknown")
-        page = doc.metadata.get("page", "?")
-        formatted.append(
-            f"EXCERPT {i} [Source: {source}, page {page}]:\n{doc.page_content}"
-        )
-    return "\n\n" + "\n\n---\n\n".join(formatted) + "\n"
-
-
-# The LCEL chain: retrieve → format → prompt → LLM → parse
-rag_chain = (
-    {
-        "context": retriever | format_docs,
-        "question": RunnablePassthrough(),
-    }
-    | prompt
-    | llm
-    | StrOutputParser()
+# 5. History-Aware Retriever
+contextualize_q_system_prompt = (
+    "Given a chat history and the latest user question "
+    "which might reference context in the chat history, "
+    "formulate a standalone question which can be understood "
+    "without the chat history. Do NOT answer the question, "
+    "just reformulate it if needed and otherwise return it as is."
+)
+contextualize_q_prompt = ChatPromptTemplate.from_messages(
+    [
+        ("system", contextualize_q_system_prompt),
+        MessagesPlaceholder("chat_history"),
+        ("human", "{input}"),
+    ]
+)
+history_aware_retriever = create_history_aware_retriever(
+    llm, compression_retriever, contextualize_q_prompt
 )
 
+# 6. Question Answering Chain
+qa_system_prompt = (
+    "You are a precise document-analysis assistant. Your ONLY job is to answer questions using the provided document excerpts.\n\n"
+    "STRICT RULES:\n"
+    "1. Use ONLY the information in the CONTEXT below. Do NOT use your own knowledge.\n"
+    "2. If the context does not contain enough information to answer, respond EXACTLY with: 'I don't have enough information in the provided documents to answer this question.'\n"
+    "3. Be thorough - include all relevant details from the context.\n"
+    "4. For every factual claim, cite the source like this: [Source: filename, page X].\n\n"
+    "CONTEXT (document excerpts):\n"
+    "{context}"
+)
+qa_prompt = ChatPromptTemplate.from_messages(
+    [
+        ("system", qa_system_prompt),
+        MessagesPlaceholder("chat_history"),
+        ("human", "{input}"),
+    ]
+)
+question_answer_chain = create_stuff_documents_chain(llm, qa_prompt)
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Public API
-# ══════════════════════════════════════════════════════════════════════════════
+# 7. Final RAG Chain
+rag_chain = create_retrieval_chain(history_aware_retriever, question_answer_chain)
 
-def ask_question(query: str) -> dict:
-    """
-    Run the full RAG pipeline for a user query.
-
-    Returns:
-        dict with keys:
-            - "answer": The LLM-generated answer grounded in retrieved context.
-            - "sources": List of LangChain Document objects used as context.
-    """
-    # Get source docs separately for citation display
-    source_docs = retriever.invoke(query)
-
-    # Run the chain
-    answer = rag_chain.invoke(query)
-
-    return {"answer": answer, "sources": source_docs}
-
-
-# ── Quick test ───────────────────────────────────────────────────────────────
-if __name__ == "__main__":
-    query = "Summarize the main topics covered in the documents."
-    print(f"\n🔍 Query: {query}\n")
-
-    response = ask_question(query)
-
-    print("=" * 60)
-    print("ANSWER:")
-    print("=" * 60)
-    print(response["answer"])
-
-    print("\n" + "=" * 60)
-    print("SOURCES:")
-    print("=" * 60)
-    for doc in response["sources"]:
-        print(f"  📄 {doc.metadata.get('source', 'unknown')} — page {doc.metadata.get('page', '?')}")
+def ask_question(query: str, chat_history: list = None) -> dict:
+    if chat_history is None:
+        chat_history = []
+        
+    response = rag_chain.invoke({
+        "input": query,
+        "chat_history": chat_history
+    })
+    
+    return {
+        "answer": response["answer"],
+        "sources": response["context"] # The retrieved documents
+    }
